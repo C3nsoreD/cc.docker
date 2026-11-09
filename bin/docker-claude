@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# --- Help ---
+usage() {
+  cat <<EOF
+Usage: docker-dind-claude [-e KEY=VALUE]... [-p HOST:CONTAINER]... [-w DIR]... [-s PATH]... [-P FILE] [-c DIR] [--persist-dind-data] [--] [claude args...]
+
+Run Claude Code in a container with Docker-in-Docker support.
+A privileged DinD sidecar is started on an isolated network so Claude Code
+can run Docker commands. Port mappings are applied to the DinD sidecar.
+
+Options:
+  -e KEY=VALUE            Pass environment variable to the Claude container (repeatable)
+  -p HOST:CONT            Publish a port mapping on the DinD sidecar (repeatable)
+  -w DIR                  Mount an additional working directory at its real path (repeatable)
+  -s PATH                 Shadow PATH (e.g. node_modules) with a per-project named volume so the
+                          host's copy never enters the container; install fresh inside (repeatable)
+  -P FILE                 Run FILE (a provisioning script) into the shared toolbox before launching,
+                          to install extra CLIs (kubectl, helm, go, LSPs). See examples/provision.sh
+  -c DIR                  Use DIR as an isolated config home (its own .claude + .claude.json)
+  -d, --persist-dind-data Persist DinD data (images, cache, volumes) across runs using a per-project named volume
+  -h, --help              Show this help message and exit
+
+The current directory is always mounted and used as the working directory.
+Use -w to also expose other project directories (e.g. 2-3 repos at once);
+each is mounted into both the Claude container and the DinD sidecar so builds work.
+
+Use -s for cross-OS dependency dirs (node_modules, .venv, target): the macOS host
+copy is shadowed by a Linux-native volume (shared with docker-claude, keyed by
+absolute path). Run the install (e.g. npm ci) inside once; it persists per project
+across runs. List volumes: docker volume ls | grep docker-claude-shadow.
+
+Extra CLI tools go in the shared toolbox volume (docker-claude-toolbox) mounted at
+/opt/toolbox, whose bin is on PATH (requires docker-claude:local). Install tools once —
+interactively or via -P FILE — and they persist across all projects and image rebuilds.
+
+For parallel sessions, prefer a shared CLAUDE_CODE_OAUTH_TOKEN over -c; sessions
+sharing one interactive login can log each other out. See README for details.
+
+The container runtime defaults to podman, falling back to docker. Override with
+CONTAINER_RUNTIME=docker.
+
+Everything after -- is passed directly to Claude Code.
+
+Examples:
+  docker-dind-claude                                    # interactive session
+  docker-dind-claude -e KEY=val                         # with env variable
+  docker-dind-claude -w ~/other-repo -w ~/lib           # mount extra working dirs
+  docker-dind-claude -s node_modules                    # Linux-native node_modules, then: npm ci
+  docker-dind-claude -c ~/.claude-sessions/a            # isolated config (safe parallel sessions)
+  docker-dind-claude -e KEY=val -- -p "explain this"    # script flags + claude flags
+  docker-dind-claude -d                                 # keep DinD data between runs
+EOF
+  exit 0
+}
+
+# --- Container runtime ---
+RUNTIME="${CONTAINER_RUNTIME:-}"
+if [ -z "$RUNTIME" ]; then
+  if command -v podman >/dev/null 2>&1; then
+    RUNTIME=podman
+  elif command -v docker >/dev/null 2>&1; then
+    RUNTIME=docker
+  else
+    echo "Error: neither podman nor docker found in PATH." >&2
+    exit 1
+  fi
+fi
+
+# --- Configuration ---
+# docker-claude:local is built from docker/claude.Dockerfile (latest Claude Code).
+IMAGE_NAME="${CLAUDE_IMAGE:-}"
+if [ -z "$IMAGE_NAME" ]; then
+  if "$RUNTIME" image inspect docker-claude:local >/dev/null 2>&1; then
+    IMAGE_NAME="docker-claude:local"
+  else
+    IMAGE_NAME="docker/sandbox-templates:claude-code"
+  fi
+fi
+CLAUDE_DIR="$HOME/.claude"
+CLAUDE_CONFIG="$HOME/.claude.json"
+DOCKER_CONFIG="$HOME/.claude/docker_config.json"
+CONFIG_HOME=""
+NETWORK_NAME="claude-dind-$$" DIND_CONTAINER="claude-dind-daemon-$$"
+
+# --- Resolve a directory to its absolute path ---
+abspath() {
+  if [ ! -d "$1" ]; then
+    echo "Error: not a directory: $1" >&2
+    exit 1
+  fi
+  (cd "$1" && pwd)
+}
+
+# --- Create a named volume (chowned to agent) once, if it doesn't exist ---
+# Fresh named volumes are root-owned; the agent user must own them to install into them.
+# Only runs on first creation, so steady-state sessions pay no extra container start.
+ensure_agent_volume() {
+  local vol="$1" path="$2"
+  if ! "$RUNTIME" volume inspect "$vol" >/dev/null 2>&1; then
+    "$RUNTIME" volume create "$vol" >/dev/null
+    "$RUNTIME" run --rm --user 0:0 --entrypoint chown \
+      -v "$vol:$path" "$IMAGE_NAME" agent:agent "$path" >/dev/null
+  fi
+}
+
+# --- Parse script flags before -- separator ---
+ENV_FLAGS=()
+PORT_FLAGS=()
+VOLUME_FLAGS=()
+WORKDIR_MOUNTS=()
+SHADOW_PATHS=()
+PROVISION=""
+CLAUDE_ARGS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage ;;
+    -e) ENV_FLAGS+=(-e "$2"); shift 2 ;;
+    -p) PORT_FLAGS+=(-p "$2"); shift 2 ;;
+    -w) dir="$(abspath "$2")"; WORKDIR_MOUNTS+=(-v "$dir:$dir"); shift 2 ;;
+    -s) SHADOW_PATHS+=("$2"); shift 2 ;;
+    -P) PROVISION="$2"; shift 2 ;;
+    -c) CONFIG_HOME="$2"; shift 2 ;;
+    -d|--persist-dind-data)
+      PROJECT_HASH=$(echo -n "$(pwd)" | md5sum | cut -c1-12)
+      VOLUME_FLAGS+=(-v "docker-dind-claude-data-${PROJECT_HASH}:/var/lib/docker")
+      shift ;;
+    --) shift; CLAUDE_ARGS+=("$@"); break ;;
+    *)  CLAUDE_ARGS+=("$1"); shift ;;
+  esac
+done
+set -- ${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}
+
+# --- Resolve config home (isolated when -c given) ---
+if [ -n "$CONFIG_HOME" ]; then
+  mkdir -p "$CONFIG_HOME"
+  CONFIG_HOME="$(abspath "$CONFIG_HOME")"
+  CLAUDE_DIR="$CONFIG_HOME/.claude"
+  CLAUDE_CONFIG="$CONFIG_HOME/.claude.json"
+fi
+
+# --- Ensure config dirs exist ---
+mkdir -p "$CLAUDE_DIR"
+mkdir -p "$(dirname "$DOCKER_CONFIG")"
+if [ ! -f "$CLAUDE_CONFIG" ]; then
+  echo "[]" > "$CLAUDE_CONFIG"
+fi
+if [ ! -f "$DOCKER_CONFIG" ]; then
+  echo "[]" > "$DOCKER_CONFIG"
+fi
+
+# --- Forward host auth tokens when set ---
+# Both bypass ~/.claude/.credentials.json, so concurrent sessions don't race on refresh.
+for _auth_var in CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY; do
+  if [ -n "${!_auth_var:-}" ]; then
+    ENV_FLAGS+=(-e "$_auth_var")
+  fi
+done
+
+# --- Route through the nexos.ai gateway when configured ---
+# NEXOS_BASE_URL + NEXOS_AI_API_KEY point Claude Code at the gateway instead of
+# Anthropic; NEXOS_MODEL pins the model id for every tier and subagents (the
+# gateway has its own catalog, so Claude Code's default ids would 404).
+if [ -n "${NEXOS_BASE_URL:-}" ] && [ -n "${NEXOS_AI_API_KEY:-}" ]; then
+  ENV_FLAGS+=(
+    -e "ANTHROPIC_BASE_URL=$NEXOS_BASE_URL"
