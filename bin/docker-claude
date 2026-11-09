@@ -4,36 +4,23 @@ set -euo pipefail
 # --- Help ---
 usage() {
   cat <<EOF
-Usage: docker-dind-claude [-e KEY=VALUE]... [-p HOST:CONTAINER]... [-w DIR]... [-s PATH]... [-P FILE] [-c DIR] [--persist-dind-data] [--] [claude args...]
+Usage: docker-dind-claude [-e KEY=VALUE]... [-p HOST:CONTAINER]... [-w DIR]... [-c DIR] [--persist-dind-data] [--] [claude args...]
 
 Run Claude Code in a container with Docker-in-Docker support.
 A privileged DinD sidecar is started on an isolated network so Claude Code
 can run Docker commands. Port mappings are applied to the DinD sidecar.
 
 Options:
-  -e KEY=VALUE            Pass environment variable to the Claude container (repeatable)
-  -p HOST:CONT            Publish a port mapping on the DinD sidecar (repeatable)
-  -w DIR                  Mount an additional working directory at its real path (repeatable)
-  -s PATH                 Shadow PATH (e.g. node_modules) with a per-project named volume so the
-                          host's copy never enters the container; install fresh inside (repeatable)
-  -P FILE                 Run FILE (a provisioning script) into the shared toolbox before launching,
-                          to install extra CLIs (kubectl, helm, go, LSPs). See examples/provision.sh
-  -c DIR                  Use DIR as an isolated config home (its own .claude + .claude.json)
-  -d, --persist-dind-data Persist DinD data (images, cache, volumes) across runs using a per-project named volume
-  -h, --help              Show this help message and exit
+  -e KEY=VALUE              Pass environment variable to the Claude container (repeatable)
+  -p HOST:CONT              Publish a port mapping on the DinD sidecar (repeatable)
+  -w DIR                    Mount an additional working directory at its real path (repeatable)
+  -c DIR                    Use DIR as an isolated config home (its own .claude + .claude.json)
+  -d, --persist-dind-data   Persist DinD data (images, cache, volumes) across runs using a per-project named volume
+  -h, --help                Show this help message and exit
 
 The current directory is always mounted and used as the working directory.
 Use -w to also expose other project directories (e.g. 2-3 repos at once);
 each is mounted into both the Claude container and the DinD sidecar so builds work.
-
-Use -s for cross-OS dependency dirs (node_modules, .venv, target): the macOS host
-copy is shadowed by a Linux-native volume (shared with docker-claude, keyed by
-absolute path). Run the install (e.g. npm ci) inside once; it persists per project
-across runs. List volumes: docker volume ls | grep docker-claude-shadow.
-
-Extra CLI tools go in the shared toolbox volume (docker-claude-toolbox) mounted at
-/opt/toolbox, whose bin is on PATH (requires docker-claude:local). Install tools once —
-interactively or via -P FILE — and they persist across all projects and image rebuilds.
 
 For parallel sessions, prefer a shared CLAUDE_CODE_OAUTH_TOKEN over -c; sessions
 sharing one interactive login can log each other out. See README for details.
@@ -47,7 +34,6 @@ Examples:
   docker-dind-claude                                    # interactive session
   docker-dind-claude -e KEY=val                         # with env variable
   docker-dind-claude -w ~/other-repo -w ~/lib           # mount extra working dirs
-  docker-dind-claude -s node_modules                    # Linux-native node_modules, then: npm ci
   docker-dind-claude -c ~/.claude-sessions/a            # isolated config (safe parallel sessions)
   docker-dind-claude -e KEY=val -- -p "explain this"    # script flags + claude flags
   docker-dind-claude -d                                 # keep DinD data between runs
@@ -82,7 +68,8 @@ CLAUDE_DIR="$HOME/.claude"
 CLAUDE_CONFIG="$HOME/.claude.json"
 DOCKER_CONFIG="$HOME/.claude/docker_config.json"
 CONFIG_HOME=""
-NETWORK_NAME="claude-dind-$$" DIND_CONTAINER="claude-dind-daemon-$$"
+NETWORK_NAME="claude-dind-$$"
+DIND_CONTAINER="claude-dind-daemon-$$"
 
 # --- Resolve a directory to its absolute path ---
 abspath() {
@@ -93,25 +80,11 @@ abspath() {
   (cd "$1" && pwd)
 }
 
-# --- Create a named volume (chowned to agent) once, if it doesn't exist ---
-# Fresh named volumes are root-owned; the agent user must own them to install into them.
-# Only runs on first creation, so steady-state sessions pay no extra container start.
-ensure_agent_volume() {
-  local vol="$1" path="$2"
-  if ! "$RUNTIME" volume inspect "$vol" >/dev/null 2>&1; then
-    "$RUNTIME" volume create "$vol" >/dev/null
-    "$RUNTIME" run --rm --user 0:0 --entrypoint chown \
-      -v "$vol:$path" "$IMAGE_NAME" agent:agent "$path" >/dev/null
-  fi
-}
-
 # --- Parse script flags before -- separator ---
 ENV_FLAGS=()
 PORT_FLAGS=()
 VOLUME_FLAGS=()
 WORKDIR_MOUNTS=()
-SHADOW_PATHS=()
-PROVISION=""
 CLAUDE_ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -119,8 +92,6 @@ while [[ $# -gt 0 ]]; do
     -e) ENV_FLAGS+=(-e "$2"); shift 2 ;;
     -p) PORT_FLAGS+=(-p "$2"); shift 2 ;;
     -w) dir="$(abspath "$2")"; WORKDIR_MOUNTS+=(-v "$dir:$dir"); shift 2 ;;
-    -s) SHADOW_PATHS+=("$2"); shift 2 ;;
-    -P) PROVISION="$2"; shift 2 ;;
     -c) CONFIG_HOME="$2"; shift 2 ;;
     -d|--persist-dind-data)
       PROJECT_HASH=$(echo -n "$(pwd)" | md5sum | cut -c1-12)
@@ -158,10 +129,59 @@ for _auth_var in CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY; do
   fi
 done
 
-# --- Route through the nexos.ai gateway when configured ---
-# NEXOS_BASE_URL + NEXOS_AI_API_KEY point Claude Code at the gateway instead of
-# Anthropic; NEXOS_MODEL pins the model id for every tier and subagents (the
-# gateway has its own catalog, so Claude Code's default ids would 404).
-if [ -n "${NEXOS_BASE_URL:-}" ] && [ -n "${NEXOS_AI_API_KEY:-}" ]; then
-  ENV_FLAGS+=(
-    -e "ANTHROPIC_BASE_URL=$NEXOS_BASE_URL"
+# --- Cleanup on exit ---
+cleanup() {
+  echo "Cleaning up..."
+  "$RUNTIME" rm -f "$DIND_CONTAINER" 2>/dev/null || true
+  "$RUNTIME" network rm -f "$NETWORK_NAME" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# --- Create isolated network ---
+"$RUNTIME" network create "$NETWORK_NAME" >/dev/null
+
+# --- Start DinD sidecar ---
+"$RUNTIME" run -d --rm \
+  --name "$DIND_CONTAINER" \
+  --network "$NETWORK_NAME" \
+  --network-alias dind \
+  --privileged \
+  ${VOLUME_FLAGS[@]+"${VOLUME_FLAGS[@]}"} \
+  -v "$(pwd):$(pwd)" -w "$(pwd)" \
+  ${WORKDIR_MOUNTS[@]+"${WORKDIR_MOUNTS[@]}"} \
+  -e DOCKER_TLS_CERTDIR="" \
+  ${PORT_FLAGS[@]+"${PORT_FLAGS[@]}"} \
+  docker:dind >/dev/null
+
+# --- Wait for DinD daemon to be ready ---
+echo "Waiting for Docker-in-Docker daemon..."
+for i in $(seq 1 30); do
+  if "$RUNTIME" exec "$DIND_CONTAINER" docker info >/dev/null 2>&1; then
+    echo "DinD ready."
+    break
+  fi
+  if [ "$i" -eq 30 ]; then
+    echo "Error: DinD daemon did not start in time." >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+# --- Prepare CLI arguments ---
+if [[ "${1:-}" == -* ]]; then
+  set -- claude "$@"
+fi
+
+# --- Run Claude Code container ---
+"$RUNTIME" run -it --rm \
+  --network "$NETWORK_NAME" \
+  -v "$(pwd):$(pwd)" -w "$(pwd)" \
+  ${WORKDIR_MOUNTS[@]+"${WORKDIR_MOUNTS[@]}"} \
+  -v "$CLAUDE_DIR:/home/agent/.claude" \
+  -v "$CLAUDE_CONFIG:/home/agent/.claude.json" \
+  -v "$DOCKER_CONFIG:/home/agent/.docker/config.json" \
+  -e TERM=xterm-256color \
+  -e COLORTERM=truecolor \
+  -e DOCKER_HOST=tcp://dind:2375 \
+  ${ENV_FLAGS[@]+"${ENV_FLAGS[@]}"} \
+  "$IMAGE_NAME" "$@"
